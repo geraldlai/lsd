@@ -444,7 +444,7 @@ the following variables are available for use (Win32 only):
 
   $_[0]    set to current filename (long form)
   $_[1]    set to current directory (long path components)
-  $_[2]    set to "$[1]\\$_[0]"
+  $_[2]    set to "$_[1]\\$_[0]"
 
 
 =head1 DEPENDENCIES
