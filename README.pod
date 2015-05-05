@@ -1,0 +1,80 @@
+=head1 NAME
+
+lsd - Portable 'ls -l' for deterministic diff-ing
+
+
+=head1 SYNOPSIS
+
+=over
+
+=item lsd
+
+ [ -r, --recursive ]       Recursively traverse directories.
+ [ -c, --checksum ]        Compute MD5 of files / directory 'lsd' listing.
+ [ -f, --followlinks ]     Stat symlink targets instead of the actual symlinks. (+)
+ [ -u, --utc ]             Use UTC time instead of local time.
+ [ -d, --delim <string> ]  Define delimiter to separate file info columns. Default " ".
+ [ -e, --exclude <code> ]  Exclude file / directory if <code> evals true. (+)
+                           Default exclude dirs: .git, .svn, CVS, _darcs, RCS, SCCS
+
+ [ --nocurdir ]            Hide current dir "." entry for each dir.
+ [ --nometa, --meta ]      Hide/Show all meta info (mode uid gid date time checksum size). (+)
+ [ --nomode ]              Hide file type & permissions "drwxr-xr-x". (+)
+ [ --nouid ]               Hide user  info of file owner. (+)(*)
+ [ --nogid ]               Hide group info of file owner. (+)(*)
+ [ --nodate ]              Hide date "2010-12-31".        (+) if --notime also
+ [ --notime ]              Hide time "16:32:05".          (+) if --nodate also
+ [ --nosize ]              Hide file size / directory files count. (+)
+                           (+) Affects --checksum
+                           (*) Only applicable on supported platforms
+
+ [ -v, --verbose  ...  ]   Show what dirs are processed. -vv for more verbosity.
+ [ -h ] [ --man ]          Command usage / manpage.
+
+ file1 [ file2  ...  ]     Specify one or more files or directories.
+
+=back
+
+
+=head1 DESCRIPTION
+
+'lsd' lists files like 'ls -l'. Directory and file names are naturally sorted and printed in a deterministic way even when directories are recursively traversed.
+
+Unlike 'ls -l', the output columns are not pretty printed in an aligned table so as to avoid one file's entry affecting the print of another entry. The consistent output produced allows for consistent 'diff's between different 'lsd' listings.
+
+The size column for directories in 'ls -l' is not very informative. Instead, 'lsd' shows the count of files within a directory as the "size" of that directory. This is in effect for the --recursive option.
+
+Likewise, the 'lsd' checksum column of a directory entry is the recursive checksum of that directory's content as printed by 'lsd'. This implies that a directory's checksum will change should any file under it change in any way. This is in effect for the --recursive option.
+
+For symlink entries, the size and checksum columns reflect the 'lsd' information of the target file.
+
+
+=head1 WINDOWS FILENAMES
+
+On Windows, long filenames are printed in UTF-8 encoding. Note that, internally, 'lsd' works on the short 8.3 form of filenames (as observed with C<-vv> verbosity) which are then converted to the long form before printing.
+
+Within the C<--exclude> callback, in addition to the traversal variables:
+
+  $_                   set to current filename
+  $File::Find::dir     set to current directory
+  $File::Find::name    set to "$File::Find::dir\\$_"
+
+the following variables are available for use (Win32 only):
+
+  $_[0]    set to current filename (long form)
+  $_[1]    set to current directory (long path components)
+  $_[2]    set to "$[1]\\$_[0]"
+
+
+=head1 DEPENDENCIES
+
+No non-core modules are required.
+
+
+=head1 AUTHOR
+
+Gerald Lai
+
+
+=cut
+
