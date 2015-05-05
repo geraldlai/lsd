@@ -1,0 +1,461 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+our $VERSION = "1.001001";
+
+use Getopt::Long qw(GetOptions);
+Getopt::Long::Configure(qw(posix_default no_ignore_case pass_through bundling));
+use Pod::Usage qw(pod2usage);
+
+use POSIX qw(strftime);
+use Cwd qw(cwd realpath);
+use File::Find qw(find);
+use File::Basename qw(dirname);
+use File::Spec::Functions qw(canonpath catfile curdir);
+use Digest::MD5 qw(md5_hex);
+use Digest::file qw(digest_file_hex);
+
+use constant META => qw(mode uid gid date time checksum size);
+
+use constant IS_WIN32 => ($^O eq "MSWin32");
+use if IS_WIN32, "Win32";
+
+my %OPT = map { $_ => 1 } META;
+$OPT{curdir} = 1;
+$OPT{checksum} = 0;
+$OPT{delim} = " ";
+$OPT{exclude} = '-d && /^(?:\.git|\.svn|CVS|_darcs|RCS|SCCS)$/';
+$OPT{verbose} = 0;
+GetOptions( \%OPT,
+    "recursive|r!",
+    "followlinks|f!",
+    "curdir!",
+    "meta!" => sub { @OPT{META()} = ($_[1]) x META },
+    "mode!",
+    "uid!",
+    "gid!",
+    "date!",
+    "time!",
+    "checksum|c!",
+    "size!",
+    "utc|u!",
+    "delim|d=s",
+    "exclude|e=s",
+    "verbose|v+",
+    "help|h|?" => \&help,
+    "man" => \&man,
+) or pod2usage(
+    -message => "lsd: Error parsing command arguments.\n",
+    -verbose => 0, # SYNOPSIS only
+    -exitval => 22,
+    -output  => \*STDERR,
+);
+
+# disable uid & gid for unsupported platforms
+$OPT{uid} = 0 if $^O =~ /^(?:MSWin32|riscos)$/;
+$OPT{gid} = 0 if $^O =~ /^(?:MSWin32|riscos|VMS)$/;
+
+my $excl_cb = do {
+    no warnings;
+    no strict;
+
+    my $code_str = "sub { $OPT{exclude} }";
+    warn "lsd: Exclude files by: $code_str\n" if $OPT{verbose} >= 1;
+
+    my $evaled = eval $code_str;
+    warn "lsd --exclude: $@\n" and exit 2 if $@;
+    warn "lsd: Cannot evaluate --exclude to CODEref.\n" and exit 2
+      unless UNIVERSAL::isa($evaled, "CODE");
+
+    $evaled;
+};
+
+my @dir_manifest = (
+    1,
+    $OPT{mode},
+    $OPT{uid},
+    $OPT{gid},
+    $OPT{date} || $OPT{time},
+    $OPT{size},
+    !$OPT{followlinks},
+    1,
+);
+
+my ($d_ref, $p_ref) = get_paths(@ARGV);
+my @dirs  = @{ $d_ref };
+my @paths = @{ $p_ref };
+warn "lsd: Nothing to do!\n" and exit 1 unless @paths;
+
+my %dir;
+my %file;
+my %rsum;
+
+find {
+    wanted => sub {
+        my $f = $_;
+        my $is_curdir = $f eq curdir();
+        $File::Find::prune = !$OPT{recursive} && !$is_curdir;
+        my $is_dir     = -d $f;
+        my $is_symlink = -l $f;
+        my $d = canonpath($File::Find::dir);
+        my $p = $is_curdir ? $d : catfile($d, $f);
+        my $p_real = canonpath(realpath($p));
+
+        warn "lsd: Processing dir: $d\n"
+          if $OPT{verbose} == 1 && !$dir{$d};
+        warn "lsd: Processing file: $p\n"
+          if $OPT{verbose} >= 2;
+
+        my ($fw, $dw, $pw);
+        ($fw, $dw, $pw) = map { Win32::GetLongPathName($_) } $f, $d, $p
+          if IS_WIN32;
+
+        ++$File::Find::prune and return
+          if !$is_curdir
+          && $excl_cb->(IS_WIN32 ? ($fw, $dw, $pw) : ());
+
+        my @stat = $is_symlink && !$OPT{followlinks}
+          ? lstat($p)
+          : stat($p);
+        my $size = $stat[7];
+        my $checksum;
+
+        unless (defined($p_real) && $rsum{$p_real})
+        {
+            # symlink takes on size/count of target
+            # directory shows its number of files
+            if ($is_dir)
+            {
+                $size = $OPT{recursive} || $is_curdir
+                  ? sub { "[" . ($dir{$p} ? scalar(keys %{ $dir{$p} }) : "?") . "]" }
+                  : "[?]";
+            }
+            elsif ($is_symlink)
+            {
+                my $tgt_size = -s $f;
+                $size = defined($tgt_size) ? $tgt_size : "x";
+            }
+
+            # directory shows checksum of its 'lsd' contents
+            $checksum = $is_dir
+              ? sub { get_checksum($p, 1) }
+              : get_checksum($p, 0)
+                if $OPT{checksum};
+        }
+        else
+        {
+            ($size, $checksum) = @{ $rsum{$p_real} };
+        }
+
+        utf8::encode($fw) if IS_WIN32 && utf8::is_utf8($fw);
+
+        my $file_ref = [
+            @stat[2, 4, 5, 9],
+            $size,
+            ($is_symlink && !$OPT{followlinks} ? readlink($p) : undef),
+            $checksum,
+            IS_WIN32 ? $fw : (),
+        ];
+
+        $file{$p} = $file_ref;
+        $rsum{$p_real} = [ $size, $checksum ] if defined($p_real);
+
+        $dir{$d}{$f} = $is_dir unless $is_curdir;
+        $dir{$p} ||= { } if $is_dir && -r $f;
+    },
+    bydepth => $OPT{recursive},
+    follow_fast => 1,
+    follow_skip => 2,
+}, @paths;
+
+print_dir($_) for @dirs;
+exit 0;
+
+
+use constant XFORM_PACK => ($] >= 5.010) ? "J>*" : "N*";
+
+sub natsort (&@) {
+    my $cb = shift;
+
+    return
+      map { $_[$_->[2]] }
+      sort {
+          my $x = defined($a->[0]) ? 0 :  1;
+          my $y = defined($b->[0]) ? 0 : -1;
+          $x || $y
+            ? $x + $y
+            : $a->[1] cmp $b->[1] || $a->[0] cmp $b->[0];
+      }
+      map {
+          my ($s, $g);
+          for ($_[$_]) { $s = $cb->() }
+
+          if (defined($s))
+          {
+              ($g) = ($s =~ /^([[:alpha:]_[:space:]]+)/);
+              my $n = ($] >= 5.010) ? 18 : 8;
+              $s =~ s{(\d{1,$n})}{ pack(XFORM_PACK, "1$1") }ge;
+          }
+
+          [ $s, lc(defined($g) ? $g : ''), $_ ];
+      } 0 .. $#_;
+}
+
+sub get_paths {
+    my @args = @_ ? @_ : cwd;
+
+    my %seen_path;
+    my @paths;
+
+    for my $arg (@args)
+    {
+        my $path = canonpath(realpath($arg));
+        warn "lsd: File not found: $arg\n" and next
+          unless defined($path) && (-e $path || -l $path);
+        push @paths, $path if !$seen_path{$path}++;
+    }
+
+    my %seen_dir;
+    my @dirs =
+      grep { !$seen_dir{$_}++ }
+      natsort { $_ }
+      map { -d $_ && ! -l $_ ? $_ : dirname($_) }
+      @paths;
+
+    return \@dirs, \@paths;
+}
+
+sub get_checksum {
+    my ($p, $is_dir) = @_;
+
+    if ($is_dir)
+    {
+        my $d = $p;
+        my $ls = $dir{$d};
+
+        if ($OPT{recursive} && $ls)
+        {
+            my $c = "";
+
+            for my $f (
+              natsort { ref($_) ? ${ $_ } : $_ } keys %{ $ls }
+            ) {
+                my $p2 = catfile($d, $f);
+                my $i = -1;
+                $c .= join $; =>
+                  map {
+                      !$dir_manifest[++$i] ? ()
+                        : !defined($_) ? ""
+                        : ref($_) ? do { $_ = $_->() }
+                        : $_;
+                  }
+                  $f, @{ $file{$p2} };
+                $c .= $; ;
+            }
+
+            return md5_hex($c);
+        }
+        else
+        {
+            return "-" x 32;
+        }
+    }
+    else
+    {
+        return -f $p && -r _
+          ? digest_file_hex($p, "MD5")
+          : " " x 32;
+    }
+}
+
+# copied and modified from Stat::lsMode
+sub format_mode {
+    my $mode = shift;
+
+    my @perms = qw(--- --x -w- -wx r-- r-x rw- rwx);
+    my @ftypes = qw(. p c ? d ? b ? - ? l ? s ? ? ?);
+    $ftypes[0] = '';
+
+    my $setids = ($mode & 07000) >> 9;
+    my @permstrs = @perms[
+      ($mode & 0700) >> 6,
+      ($mode & 0070) >> 3,
+      ($mode & 0007),
+    ];
+    my $ftype = $ftypes[($mode & 0170000) >> 12];
+
+    if ($setids)
+    {
+        $permstrs[0] =~ s{([-x])$}{ $1 eq 'x' ? 's' : 'S' }e
+          if $setids & 04; # setuid bit
+        $permstrs[1] =~ s{([-x])$}{ $1 eq 'x' ? 's' : 'S' }e
+          if $setids & 02; # setgid bit
+        $permstrs[2] =~ s{([-x])$}{ $1 eq 'x' ? 't' : 'T' }e
+          if $setids & 01; # sticky bit
+    }
+
+    return join "" => $ftype, @permstrs;
+}
+
+sub print_file {
+    my ($p, $f) = @_;
+    my ($mode, $uid, $gid, $mtime, $size, $link, $checksum, $fw) = @{ $file{$p} };
+    $file{$p}[4] = $size = $size->() if ref($size);
+    $file{$p}[6] = $checksum = $checksum->() if ref($checksum);
+
+    print IS_WIN32 ? $fw : $f;
+    print " -> ", $link if defined($link);
+    print "\t| ";
+    print "< cannot stat >\n" and return unless defined($mode);
+    print format_mode($mode), $OPT{delim} if $OPT{mode};
+
+    print scalar(getpwuid($uid)), $OPT{delim} if $OPT{uid};
+    print scalar(getgrgid($gid)), $OPT{delim} if $OPT{gid};
+
+    my @mtime = $OPT{utc} ? gmtime($mtime) : localtime($mtime);
+    print strftime("%Y-%m-%d", @mtime), $OPT{delim} if $OPT{date};
+    print strftime("%X",       @mtime), $OPT{delim} if $OPT{time};
+
+    print $checksum, $OPT{delim} if $OPT{checksum};
+    print $size, $OPT{delim} if $OPT{size};
+    print "\n";
+}
+
+my %printed;
+
+sub print_dir {
+    my ($d) = @_;
+    my $ls = $dir{$d};
+    return if $printed{$d}++;
+
+    my $dw;
+    if (IS_WIN32)
+    {
+        $dw = Win32::GetLongPathName($d);
+        utf8::encode($dw) if utf8::is_utf8($dw);
+    }
+
+    my @subdirs;
+    print "[ ", (IS_WIN32 ? $dw : $d), " ]\n";
+    print_file($d, curdir()) if $OPT{curdir} && $file{$d};
+    print "< unknown contents >\n\n" and return unless $ls;
+
+    for my $f (
+      natsort { ref($_) ? ${ $_ } : $_ } keys %{ $ls }
+    ) {
+        my $is_dir = $ls->{$f};
+        my $p = catfile($d, $f);
+        push(@subdirs, $p) if $is_dir;
+        print_file($p, $f);
+    }
+    print "\n";
+
+    if ($OPT{recursive})
+    {
+        print_dir($_) for @subdirs;
+    }
+}
+
+# SYNOPSIS
+sub help {
+    pod2usage(
+        -verbose => 1,
+        -exitval => 1,
+        -output  => \*STDERR,
+    );
+}
+
+# man page of POD
+sub man {
+    pod2usage(
+        -verbose => 2,
+        -exitval => 1,
+        -output  => \*STDOUT,
+    );
+}
+
+
+__END__
+
+=head1 NAME
+
+lsd - Portable 'ls -l' for deterministic diff-ing
+
+
+=head1 SYNOPSIS
+
+=over
+
+=item lsd
+
+ [ -r, --recursive ]       Recursively traverse directories.
+ [ -c, --checksum ]        Compute MD5 of files / directory 'lsd' listing.
+ [ -f, --followlinks ]     Stat symlink targets instead of the actual symlinks. (+)
+ [ -u, --utc ]             Use UTC time instead of local time.
+ [ -d, --delim <string> ]  Define delimiter to separate file info columns. Default " ".
+ [ -e, --exclude <code> ]  Exclude file / directory if <code> evals true. (+)
+                           Default exclude dirs: .git, .svn, CVS, _darcs, RCS, SCCS
+
+ [ --nocurdir ]            Hide current dir "." entry for each dir.
+ [ --nometa, --meta ]      Hide/Show all meta info (mode uid gid date time checksum size). (+)
+ [ --nomode ]              Hide file type & permissions "drwxr-xr-x". (+)
+ [ --nouid ]               Hide user  info of file owner. (+)(*)
+ [ --nogid ]               Hide group info of file owner. (+)(*)
+ [ --nodate ]              Hide date "2010-12-31".        (+) if --notime also
+ [ --notime ]              Hide time "16:32:05".          (+) if --nodate also
+ [ --nosize ]              Hide file size / directory files count. (+)
+                           (+) Affects --checksum
+                           (*) Only applicable on supported platforms
+
+ [ -v, --verbose  ...  ]   Show what dirs are processed. -vv for more verbosity.
+ [ -h ] [ --man ]          Command usage / manpage.
+
+ file1 [ file2  ...  ]     Specify one or more files or directories.
+
+=back
+
+
+=head1 DESCRIPTION
+
+'lsd' lists files like 'ls -l'. Directory and file names are naturally sorted and printed in a deterministic way even when directories are recursively traversed.
+
+Unlike 'ls -l', the output columns are not pretty printed in an aligned table so as to avoid one file's entry affecting the print of another entry. The consistent output produced allows for consistent 'diff's between different 'lsd' listings.
+
+The size column for directories in 'ls -l' is not very informative. Instead, 'lsd' shows the count of files within a directory as the "size" of that directory. This is in effect for the --recursive option.
+
+Likewise, the 'lsd' checksum column of a directory entry is the recursive checksum of that directory's content as printed by 'lsd'. This implies that a directory's checksum will change should any file under it change in any way. This is in effect for the --recursive option.
+
+For symlink entries, the size and checksum columns reflect the 'lsd' information of the target file.
+
+
+=head1 WINDOWS FILENAMES
+
+On Windows, long filenames are printed in UTF-8 encoding. Note that, internally, 'lsd' works on the short 8.3 form of filenames (as observed with C<-vv> verbosity) which are then converted to the long form before printing.
+
+Within the C<--exclude> callback, in addition to the traversal variables:
+
+  $_                   set to current filename
+  $File::Find::dir     set to current directory
+  $File::Find::name    set to "$File::Find::dir\\$_"
+
+the following variables are available for use (Win32 only):
+
+  $_[0]    set to current filename (long form)
+  $_[1]    set to current directory (long path components)
+  $_[2]    set to "$[1]\\$_[0]"
+
+
+=head1 DEPENDENCIES
+
+No non-core modules are required.
+
+
+=head1 AUTHOR
+
+Gerald Lai
+
+
+=cut
+
