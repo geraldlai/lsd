@@ -66,11 +66,6 @@ the following variables are available for use (Win32 only):
   $_[2]    set to "$_[1]\\$_[0]"
 
 
-=head1 DEPENDENCIES
-
-No non-core modules are required.
-
-
 =head1 AUTHOR
 
 Gerald Lai
